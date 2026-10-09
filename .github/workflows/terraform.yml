@@ -1,4 +1,8 @@
-name: Terraform Destroy
+name: Destroy Existing Resources
+
+# Terminates EC2 instances created by this Terraform project, found by tag
+# (Project=modules-new + Environment=<env>). Use this when Terraform state is
+# lost and "terraform destroy" can no longer see the resources.
 
 on:
   workflow_dispatch:
@@ -7,50 +11,44 @@ on:
         description: Environment to destroy
         type: choice
         required: true
+        default: dev
         options:
           - dev
           - uat
           - prd
-      confirm:
-        description: 'Type "destroy-<environment>" to confirm (e.g. destroy-dev)'
-        type: string
+          - all
+      dry_run:
+        description: Only list what would be terminated (no deletion)
+        type: boolean
         required: true
+        default: true
+      confirm:
+        description: 'For a real run type "destroy-<environment>" (e.g. destroy-dev or destroy-all)'
+        type: string
+        required: false
 
 permissions:
   contents: read
 
 env:
-  TF_VERSION: 1.5.7
   AWS_REGION: ap-south-1
+  PROJECT_TAG: modules-new
 
 jobs:
   destroy:
-    name: Destroy ${{ inputs.environment }}
+    name: Destroy ${{ inputs.environment }} (dry run - ${{ inputs.dry_run }})
     runs-on: ubuntu-latest
-    # Add required reviewers on the GitHub Environment for an approval gate
-    environment: ${{ inputs.environment }}
-    # Share the lock group with apply so the two never run at the same time
-    concurrency:
-      group: tf-apply-${{ inputs.environment }}
-      cancel-in-progress: false
     steps:
       - name: Verify confirmation
+        if: ${{ !inputs.dry_run }}
         env:
           TARGET_ENV: ${{ inputs.environment }}
           CONFIRM: ${{ inputs.confirm }}
         run: |
           if [ "$CONFIRM" != "destroy-$TARGET_ENV" ]; then
-            echo "Confirmation text does not match 'destroy-$TARGET_ENV'. Aborting."
+            echo "Confirmation does not match 'destroy-$TARGET_ENV'. Aborting."
             exit 1
           fi
-
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -59,28 +57,47 @@ jobs:
           aws-secret-access-key: ${{ secrets.SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Initialize Terraform
-        run: terraform init -input=false
-
-      - name: Plan destroy (${{ inputs.environment }})
-        shell: bash
+      - name: Find instances
+        id: find
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
         run: |
-          terraform plan -destroy \
-            -input=false \
-            -no-color \
-            -var-file=${{ inputs.environment }}.tfvars \
-            -out=tfdestroy-${{ inputs.environment }} \
-            | tee destroy-plan.txt
+          if [ "$TARGET_ENV" = "all" ]; then
+            ENVS="dev,uat,prd"
+          else
+            ENVS="$TARGET_ENV"
+          fi
 
-      - name: Add destroy plan to job summary
-        if: always()
-        run: |
+          IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT_TAG" \
+                      "Name=tag:Environment,Values=$ENVS" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query "Reservations[].Instances[].InstanceId" \
+            --output text)
+
           {
-            echo "### Terraform destroy plan: ${{ inputs.environment }}"
+            echo "### Instances matching Project=$PROJECT_TAG, Environment=$ENVS"
             echo '```'
-            tail -n 60 destroy-plan.txt || true
+            aws ec2 describe-instances \
+              --filters "Name=tag:Project,Values=$PROJECT_TAG" \
+                        "Name=tag:Environment,Values=$ENVS" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query "Reservations[].Instances[].[InstanceId,InstanceType,State.Name,Tags[?Key=='Name']|[0].Value]" \
+              --output table
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Terraform destroy (${{ inputs.environment }})
-        run: terraform apply -input=false -no-color tfdestroy-${{ inputs.environment }}
+          echo "ids=$IDS" >> "$GITHUB_OUTPUT"
+
+      - name: Terminate instances
+        if: ${{ !inputs.dry_run && steps.find.outputs.ids != '' }}
+        env:
+          IDS: ${{ steps.find.outputs.ids }}
+        run: |
+          aws ec2 terminate-instances --instance-ids $IDS
+          aws ec2 wait instance-terminated --instance-ids $IDS
+          echo "Terminated: $IDS"
+
+      - name: Nothing to do
+        if: ${{ steps.find.outputs.ids == '' }}
+        run: echo "No matching instances found."
