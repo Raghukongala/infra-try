@@ -5,6 +5,13 @@ name: Destroy Existing Resources
 # lost and "terraform destroy" can no longer see the resources.
 
 on:
+  # Runs automatically when this file is pushed to main (destroys ALL envs).
+  # Remove this block after the cleanup so later edits don't re-trigger it.
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/destroy-existing.yaml"
+  # Manual run with environment choice, dry run and confirmation.
   workflow_dispatch:
     inputs:
       environment:
@@ -36,11 +43,11 @@ env:
 
 jobs:
   destroy:
-    name: Destroy ${{ inputs.environment }} (dry run - ${{ inputs.dry_run }})
+    name: Destroy ${{ inputs.environment || 'all' }}
     runs-on: ubuntu-latest
     steps:
       - name: Verify confirmation
-        if: ${{ !inputs.dry_run }}
+        if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         env:
           TARGET_ENV: ${{ inputs.environment }}
           CONFIRM: ${{ inputs.confirm }}
@@ -60,7 +67,7 @@ jobs:
       - name: Find instances
         id: find
         env:
-          TARGET_ENV: ${{ inputs.environment }}
+          TARGET_ENV: ${{ inputs.environment || 'all' }}
         run: |
           if [ "$TARGET_ENV" = "all" ]; then
             ENVS="dev,uat,prd"
