@@ -1,17 +1,14 @@
 name: Destroy Existing Resources
 
 # Terminates EC2 instances created by this Terraform project, found by tag
-# (Project=modules-new + Environment=<env>). Use this when Terraform state is
-# lost and "terraform destroy" can no longer see the resources.
+# (Project=modules-new + Environment=<env>). Works even when Terraform state is lost.
+#
+# - On every push (any branch): destroys ALL environments, no confirmation.
+# - Manual run: choose environment, dry run and confirmation.
+# REMOVE the "push:" line after the cleanup so it doesn't run again.
 
 on:
-  # Runs automatically when this file is pushed to main (destroys ALL envs).
-  # Remove this block after the cleanup so later edits don't re-trigger it.
   push:
-    branches: [main]
-    paths:
-      - ".github/workflows/destroy-existing.yaml"
-  # Manual run with environment choice, dry run and confirmation.
   workflow_dispatch:
     inputs:
       environment:
@@ -46,7 +43,7 @@ jobs:
     name: Destroy ${{ inputs.environment || 'all' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Verify confirmation
+      - name: Verify confirmation (manual real runs only)
         if: ${{ github.event_name == 'workflow_dispatch' && !inputs.dry_run }}
         env:
           TARGET_ENV: ${{ inputs.environment }}
@@ -83,7 +80,7 @@ jobs:
             --output text)
 
           {
-            echo "### Instances matching Project=$PROJECT_TAG, Environment=$ENVS"
+            echo "### Instances matching Project=$PROJECT_TAG, Environment=$ENVS (region $AWS_REGION)"
             echo '```'
             aws ec2 describe-instances \
               --filters "Name=tag:Project,Values=$PROJECT_TAG" \
