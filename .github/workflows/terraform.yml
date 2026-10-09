@@ -1,9 +1,20 @@
-name: Terraform CI
+name: Terraform Destroy
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to destroy
+        type: choice
+        required: true
+        options:
+          - dev
+          - uat
+          - prd
+      confirm:
+        description: 'Type "destroy-<environment>" to confirm (e.g. destroy-dev)'
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -13,54 +24,26 @@ env:
   AWS_REGION: ap-south-1
 
 jobs:
-  validate:
-    name: Validate ${{ matrix.root }}
+  destroy:
+    name: Destroy ${{ inputs.environment }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        root:
-          - .
-          - organization
-    defaults:
-      run:
-        working-directory: ${{ matrix.root }}
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Check formatting
-        run: terraform fmt -check -recursive
-
-      - name: Initialize Terraform
-        run: terraform init -backend=false
-
-      - name: Validate configuration
-        run: terraform validate
-
-  plan:
-    name: Plan ${{ matrix.environment }}
-    needs: validate
-    # Skip on fork PRs, where secrets are unavailable
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        environment: [dev, uat, prd]
-    # Per-environment approvals/secrets can be attached via GitHub Environments
-    environment: ${{ matrix.environment }}
+    # Add required reviewers on the GitHub Environment for an approval gate
+    environment: ${{ inputs.environment }}
+    # Share the lock group with apply so the two never run at the same time
     concurrency:
-      group: tf-plan-${{ matrix.environment }}-${{ github.ref }}
-      cancel-in-progress: true
+      group: tf-apply-${{ inputs.environment }}
+      cancel-in-progress: false
     steps:
+      - name: Verify confirmation
+        env:
+          TARGET_ENV: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "destroy-$TARGET_ENV" ]; then
+            echo "Confirmation text does not match 'destroy-$TARGET_ENV'. Aborting."
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@v4
 
@@ -79,79 +62,25 @@ jobs:
       - name: Initialize Terraform
         run: terraform init -input=false
 
-      - name: Terraform plan (${{ matrix.environment }})
-        id: plan
-        shell: bash # enables pipefail so a failed plan fails the step
+      - name: Plan destroy (${{ inputs.environment }})
+        shell: bash
         run: |
-          terraform plan \
+          terraform plan -destroy \
             -input=false \
             -no-color \
-            -var-file=${{ matrix.environment }}.tfvars \
-            -out=tfplan-${{ matrix.environment }} \
-            | tee plan-${{ matrix.environment }}.txt
+            -var-file=${{ inputs.environment }}.tfvars \
+            -out=tfdestroy-${{ inputs.environment }} \
+            | tee destroy-plan.txt
 
-      - name: Add plan to job summary
+      - name: Add destroy plan to job summary
         if: always()
         run: |
           {
-            echo "### Terraform plan: ${{ matrix.environment }}"
+            echo "### Terraform destroy plan: ${{ inputs.environment }}"
             echo '```'
-            tail -n 60 plan-${{ matrix.environment }}.txt || true
+            tail -n 60 destroy-plan.txt || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload plan artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tfplan-${{ matrix.environment }}
-          path: |
-            tfplan-${{ matrix.environment }}
-            plan-${{ matrix.environment }}.txt
-          retention-days: 7
-
-  apply:
-    name: Apply ${{ matrix.environment }}
-    needs: plan
-    # Only apply from main (push or manual run), never from PRs or other branches
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: true # stop the chain if an earlier environment fails
-      max-parallel: 1 # dev -> uat -> prd, one at a time
-      matrix:
-        environment: [dev, uat, prd]
-    # Add required reviewers on the 'prd' (and optionally 'uat') GitHub Environment
-    # to get a manual approval gate before apply.
-    environment: ${{ matrix.environment }}
-    concurrency:
-      group: tf-apply-${{ matrix.environment }}
-      cancel-in-progress: false # never cancel a running apply
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.ACCESS_KEY }}
-          aws-secret-access-key: ${{ secrets.SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Download reviewed plan
-        uses: actions/download-artifact@v4
-        with:
-          name: tfplan-${{ matrix.environment }}
-
-      - name: Initialize Terraform
-        run: terraform init -input=false
-
-      - name: Terraform apply (${{ matrix.environment }})
-        run: terraform apply -input=false -no-color tfplan-${{ matrix.environment }}
+      - name: Terraform destroy (${{ inputs.environment }})
+        run: terraform apply -input=false -no-color tfdestroy-${{ inputs.environment }}
